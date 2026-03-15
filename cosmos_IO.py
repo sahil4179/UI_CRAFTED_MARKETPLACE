@@ -6,7 +6,7 @@ from dotenv import find_dotenv, load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure, PyMongoError
 
-load_dotenv(find_dotenv())   # walks up the tree to find .env regardless of CWD
+load_dotenv(find_dotenv(), override=True)  # walks up the tree to find .env regardless of CWD
 
 # ── Connection ───────────────────────────────────────────────────────────────
 

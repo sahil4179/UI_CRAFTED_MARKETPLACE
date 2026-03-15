@@ -63,17 +63,29 @@ def _verify_password(plain: str, hashed: str) -> bool:
     except Exception:
         return False
 
-CAT_BRAND        = "brand_guidelines"
-CAT_PROMPT       = "prompts"
-CAT_TEMPLATE     = "templates"
-CAT_SETTINGS     = "settings"
+CAT_BRAND         = "brand_guidelines"
+CAT_PROMPT        = "prompts"
+CAT_TEMPLATE      = "templates"
+CAT_SETTINGS      = "settings"
 CAT_SYSTEM_PROMPT = "system_prompt"
-SETTINGS_ID      = "api_settings"
-USERS_COL        = "users"   # shared, not tenant-scoped
+USERS_COL         = "users"   # shared, not tenant-scoped
 
 # ── Shared flight_operations collections (db_name=None → COSMOS_DB_NAME) ─────
-CAT_TENANT_API_CONFIGS    = "tenant_api_configs"     # flat API config per tenant
 CAT_TENANT_AGENT_SETTINGS = "tenant_agent_settings"  # agent selection per tenant
+
+# ── API key mapping: component id ↔ DB field name ────────────────────────────
+DB_KEY_MAP = {
+    "airline":    "Airline_api",
+    "cdp":        "Cdp_Api",
+    "disruption": "Disruption_Api",
+}
+DB_KEY_REVERSE = {v: k for k, v in DB_KEY_MAP.items()}
+
+API_META = {
+    "airline":    {"name": "Airline API",    "desc": "Flight search and seat map data for recovery flow",   "dot": "purple"},
+    "cdp":        {"name": "CDP API",        "desc": "Customer Data Platform for passenger profile lookup", "dot": "green"},
+    "disruption": {"name": "Disruption API", "desc": "Flight disruption events lookup by PNR",              "dot": "yellow"},
+}
 
 
 def _clean_db_name(company_name: str) -> str:
@@ -95,43 +107,13 @@ def require_tenant(x_tenant_id: str | None = Header(default=None)) -> str:
     """Read tenant ID from request header."""
     return (x_tenant_id or "").strip()
 
-DEFAULT_APIS = [
-    {
-        "id": "airline",
-        "name": "Airline API",
-        "desc": "Flight search and seat map data for recovery flow",
-        "dot": "purple",
-        "baseUrl": "",
-        "apiKey": "",
-        "isActive": True,
-    },
-    {
-        "id": "cdp",
-        "name": "CDP API",
-        "desc": "Customer Data Platform for passenger profile lookup",
-        "dot": "green",
-        "baseUrl": "",
-        "apiKey": "",
-        "isActive": True,
-    },
-    {
-        "id": "disruption",
-        "name": "Disruption API",
-        "desc": "Flight disruption events lookup by PNR",
-        "dot": "yellow",
-        "baseUrl": "",
-        "apiKey": "",
-        "isActive": True,
-    },
-]
+
 
 DEFAULT_SETTINGS = {
-    "id": SETTINGS_ID,
-    "apis": DEFAULT_APIS,
-    "recoveryAgent": "Select Agent",
-    "messagingAgent": "Select Agent",
-    "recoveryAgentActive": True,
-    "messagingAgentActive": True,
+    "isActive":       True,
+    "Airline_api":    {"baseUrl": "", "apiKey": "", "isActive": True},
+    "Cdp_Api":        {"baseUrl": "", "apiKey": "", "isActive": True},
+    "Disruption_Api": {"baseUrl": "", "apiKey": "", "isActive": True},
 }
 
 
@@ -181,10 +163,6 @@ class ApiConfigItem(BaseModel):
 
 class SettingsIn(BaseModel):
     apis: list[ApiConfigItem]
-    recoveryAgent: str
-    messagingAgent: str
-    recoveryAgentActive: bool = True
-    messagingAgentActive: bool = True
 
 
 class AgentSettingsIn(BaseModel):
@@ -219,55 +197,59 @@ def _normalize_template(doc: dict) -> dict:
             "content": doc.get("content")}
 
 
-def _normalize_settings(doc: dict | None) -> dict:
+def _flat_to_apis(doc: dict) -> list[dict]:
+    """Convert flat DB keys (Airline_api / Cdp_Api / Disruption_Api) → frontend apis array."""
+    apis = []
+    for db_key, comp_id in DB_KEY_REVERSE.items():
+        obj = doc.get(db_key)
+        if obj and isinstance(obj, dict):
+            apis.append({
+                "id":       comp_id,
+                **API_META[comp_id],
+                "baseUrl":  obj.get("baseUrl",  obj.get("base_url",  "")),
+                "apiKey":   obj.get("apiKey",   obj.get("api_key",   "")),
+                "isActive": obj.get("isActive", obj.get("is_active", True)),
+            })
+    # Fall back to stored apis array (legacy) or defaults if flat keys absent
+    if not apis:
+        apis = doc.get("apis") 
+    return apis
+
+
+def _normalize_settings(doc: dict | None, tenant_id: str = "") -> dict:
     d = doc or {}
-    result = {"id": SETTINGS_ID,
-              "apis":           d.get("apis") or DEFAULT_APIS,
-              "recoveryAgent":  _pick(d, "recoveryAgent",  "recovery_agent",  default="Select Agent"),
-              "messagingAgent": _pick(d, "messagingAgent", "messaging_agent", default="Select Agent"),
-              "recoveryAgentActive": bool(d.get("recoveryAgentActive", d.get("recovery_agent_active", True))),
-              "messagingAgentActive": bool(d.get("messagingAgentActive", d.get("messaging_agent_active", True)))}
-    if d.get("tenantId"):
-        result["tenantId"] = d["tenantId"]
+    result = {
+        "id":                  tenant_id or d.get("id", ""),
+        "tenantId":            tenant_id or d.get("tenantId", ""),
+        "isActive":            True,
+        "apis":                _flat_to_apis(d),
+        "recoveryAgent":       _pick(d, "recoveryAgent",       "recovery_agent",       default="Select Agent"),
+        "messagingAgent":      _pick(d, "messagingAgent",      "messaging_agent",      default="Select Agent"),
+        "recoveryAgentActive": bool(d.get("recoveryAgentActive", d.get("recovery_agent_active", True))),
+        "messagingAgentActive":bool(d.get("messagingAgentActive",d.get("messaging_agent_active",True))),
+    }
     return result
 
 
-def _build_flat_api_config(tenant_id: str, apis: list) -> dict:
-    """Build the flat per-tenant API config document for flight_operations storage."""
-    doc: dict = {"id": tenant_id, "tenantId": tenant_id, "isActive": True}
-    key_map = {"airline": "Airline_api", "cdp": "Cdp_Api", "disruption": "Disruption_Api"}
-    for api in apis:
-        api_dict = api if isinstance(api, dict) else api.model_dump()
-        field = key_map.get(api_dict.get("id", ""))
-        if field:
-            doc[field] = {
-                "baseUrl":  api_dict.get("baseUrl", ""),
-                "apiKey":   api_dict.get("apiKey", ""),
-                "isActive": api_dict.get("isActive", True),
-            }
-    return doc
-
 
 def ensure_settings(db_name: str, tenant_id: str = "") -> dict:
-    doc = cosmos.get_item(CAT_SETTINGS, SETTINGS_ID, db_name=db_name)
+    # Settings doc is keyed by tenantId
+    settings_id = tenant_id or "default"
+    doc = cosmos.get_item(CAT_SETTINGS, settings_id, db_name=db_name)
     if not doc:
         cosmos.ensure_tenant_collections(db_name)
-        initial = DEFAULT_SETTINGS.copy()
-        if tenant_id:
-            initial["tenantId"] = tenant_id
+        initial = {**DEFAULT_SETTINGS, "id": settings_id, "tenantId": settings_id}
         doc = cosmos.upsert_item(CAT_SETTINGS, initial, db_name=db_name)
-    elif tenant_id and not doc.get("tenantId"):
-        doc = cosmos.upsert_item(CAT_SETTINGS, {**doc, "tenantId": tenant_id}, db_name=db_name)
     # Overlay agent selections from shared flight_operations if present
     if tenant_id:
         agent_doc = cosmos.get_item(CAT_TENANT_AGENT_SETTINGS, tenant_id, db_name=None)
         if agent_doc:
             doc = {**doc,
-                   "recoveryAgent":       agent_doc.get("recoveryAgent",       doc.get("recoveryAgent",       "Select Agent")),
-                   "messagingAgent":      agent_doc.get("messagingAgent",      doc.get("messagingAgent",      "Select Agent")),
-                   "recoveryAgentActive": agent_doc.get("recoveryAgentActive", doc.get("recoveryAgentActive", True)),
-                   "messagingAgentActive":agent_doc.get("messagingAgentActive",doc.get("messagingAgentActive",True))}
-    return _normalize_settings(doc)
+                   "recoveryAgent":        agent_doc.get("recoveryAgent",        doc.get("recoveryAgent",        "Select Agent")),
+                   "messagingAgent":       agent_doc.get("messagingAgent",       doc.get("messagingAgent",       "Select Agent")),
+                   "recoveryAgentActive":  agent_doc.get("recoveryAgentActive",  doc.get("recoveryAgentActive",  True)),
+                   "messagingAgentActive": agent_doc.get("messagingAgentActive", doc.get("messagingAgentActive", True))}
+    return _normalize_settings(doc, tenant_id)
 
 
 def get_fixed_system_prompt(_db_name: str | None = None) -> str:
@@ -316,11 +298,10 @@ def login(payload: LoginIn) -> dict:
     if not user or not _verify_password(payload.password, user.get("passwordHash", "")):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     tenant_id = user["tenantId"]
-    # Mark this tenant as active in the shared flight_operations collections
-    for col in (CAT_TENANT_API_CONFIGS, CAT_TENANT_AGENT_SETTINGS):
-        existing = cosmos.get_item(col, tenant_id, db_name=None)
-        if existing:
-            cosmos.upsert_item(col, {**existing, "isActive": True}, db_name=None)
+    # Mark this tenant as active in the shared flight_operations agent settings
+    existing = cosmos.get_item(CAT_TENANT_AGENT_SETTINGS, tenant_id, db_name=None)
+    if existing:
+        cosmos.upsert_item(CAT_TENANT_AGENT_SETTINGS, {**existing, "isActive": True}, db_name=None)
     return {"tenantId": tenant_id, "email": user["email"], "companyName": user["companyName"], "dbName": user["dbName"]}
 
 
@@ -333,11 +314,10 @@ def logout(payload: LogoutIn) -> dict:
     tenant_id = payload.tenantId.strip()
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenantId is required")
-    # Mark this tenant inactive in both shared flight_operations collections
-    for col in (CAT_TENANT_API_CONFIGS, CAT_TENANT_AGENT_SETTINGS):
-        existing = cosmos.get_item(col, tenant_id, db_name=None)
-        if existing:
-            cosmos.upsert_item(col, {**existing, "isActive": False}, db_name=None)
+    # Mark this tenant inactive in shared flight_operations agent settings
+    existing = cosmos.get_item(CAT_TENANT_AGENT_SETTINGS, tenant_id, db_name=None)
+    if existing:
+        cosmos.upsert_item(CAT_TENANT_AGENT_SETTINGS, {**existing, "isActive": False}, db_name=None)
     return {"loggedOut": True}
 
 
@@ -531,29 +511,53 @@ def delete_message_template(item_id: str, db_name: str = Depends(require_db)) ->
 def get_settings(db_name: str = Depends(require_db), tenant_id: str = Depends(require_tenant)) -> dict:
     return ensure_settings(db_name, tenant_id)
 
+
 @app.put("/api/settings")
-def save_settings(payload: SettingsIn, db_name: str = Depends(require_db), tenant_id: str = Depends(require_tenant)) -> dict:
-    # Preserve existing fields (createdAt, tenantId, etc.) when updating
-    existing = cosmos.get_item(CAT_SETTINGS, SETTINGS_ID, db_name=db_name) or {}
-    doc = {**existing, **payload.model_dump(), "id": SETTINGS_ID}
-    if tenant_id:
-        doc["tenantId"] = tenant_id
+def save_settings(
+    payload: SettingsIn,
+    db_name: str = Depends(require_db),
+    tenant_id: str = Depends(require_tenant),
+) -> dict:
+    settings_id = tenant_id or "default"
+    existing = cosmos.get_item(CAT_SETTINGS, settings_id, db_name=db_name) or {}
+
+    # Build flat-key entries from the apis array
+    flat_apis: dict = {}
+    for api_item in payload.apis:
+        a = api_item if isinstance(api_item, dict) else api_item.model_dump()
+        db_key = DB_KEY_MAP.get(a["id"])
+        if db_key:
+            flat_apis[db_key] = {
+                "baseUrl":  a.get("baseUrl",  ""),
+                "apiKey":   a.get("apiKey",   ""),
+                "isActive": a.get("isActive", True),
+            }
+
+    doc = {
+        **existing,                           # preserve createdAt, etc.
+        "id":                  settings_id,
+        "tenantId":            settings_id,
+        "isActive":            True,
+        **flat_apis,                          # Airline_api / Cdp_Api / Disruption_Api at top level
+    }
+    doc.pop("apis", None)                     # remove legacy array format if present
+
     saved = cosmos.upsert_item(CAT_SETTINGS, doc, db_name=db_name)
-    # Mirror API configs to shared flight_operations DB in flat format keyed by tenantId
-    if tenant_id:
-        flat_doc = _build_flat_api_config(tenant_id, payload.model_dump()["apis"])
-        cosmos.upsert_item(CAT_TENANT_API_CONFIGS, flat_doc, db_name=None)
-    return _normalize_settings(saved)
+    return _normalize_settings(saved, tenant_id)
+
 
 @app.patch("/api/settings/agents")
-def save_agent_settings(payload: AgentSettingsIn, db_name: str = Depends(require_db), tenant_id: str = Depends(require_tenant)) -> dict:
-    """Update only agent fields — never overwrites apis/baseUrl/apiKey."""
-    existing = cosmos.get_item(CAT_SETTINGS, SETTINGS_ID, db_name=db_name) or DEFAULT_SETTINGS.copy()
-    previous_recovery_agent = existing.get("recoveryAgent", "Select Agent")
+def save_agent_settings(
+    payload: AgentSettingsIn,
+    db_name: str = Depends(require_db),
+    tenant_id: str = Depends(require_tenant),
+) -> dict:
+    """Update only agent fields — never overwrites Airline_api/Cdp_Api/Disruption_Api."""
+    settings_id = tenant_id or "default"
+    existing = cosmos.get_item(CAT_SETTINGS, settings_id, db_name=db_name) or {**DEFAULT_SETTINGS, "id": settings_id, "tenantId": settings_id}
+    previous_recovery_agent  = existing.get("recoveryAgent",  "Select Agent")
     previous_messaging_agent = existing.get("messagingAgent", "Select Agent")
-    updated = {**existing, **payload.model_dump(), "id": SETTINGS_ID}
-    if tenant_id:
-        updated["tenantId"] = tenant_id
+    updated = {**existing, **payload.model_dump(), "id": settings_id, "tenantId": settings_id, "isActive": True}
     saved = cosmos.upsert_item(CAT_SETTINGS, updated, db_name=db_name)
     # Write agent selection to shared flight_operations DB keyed by tenantId
     if tenant_id:
@@ -563,25 +567,24 @@ def save_agent_settings(payload: AgentSettingsIn, db_name: str = Depends(require
         _sync_selected_agent_status(previous_recovery_agent, False, db_name=db_name)
     if previous_messaging_agent != payload.messagingAgent:
         _sync_selected_agent_status(previous_messaging_agent, False, db_name=db_name)
-    _sync_selected_agent_status(payload.recoveryAgent, payload.recoveryAgentActive, db_name=db_name)
+    _sync_selected_agent_status(payload.recoveryAgent,  payload.recoveryAgentActive,  db_name=db_name)
     _sync_selected_agent_status(payload.messagingAgent, payload.messagingAgentActive, db_name=db_name)
-    return _normalize_settings(saved)
+    return _normalize_settings(saved, tenant_id)
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/dashboard-summary")
 def dashboard_summary(db_name: str = Depends(require_db), tenant_id: str = Depends(require_tenant)) -> dict:
-    settings  = ensure_settings(db_name, tenant_id)
-    recovery_agent = settings.get("recoveryAgent", "Select Agent")
+    settings        = ensure_settings(db_name, tenant_id)
+    recovery_agent  = settings.get("recoveryAgent",  "Select Agent")
     messaging_agent = settings.get("messagingAgent", "Select Agent")
     return {
-        "brandCount":    len(cosmos.list_items(CAT_BRAND,  db_name=db_name)),
-        "promptCount":   len(cosmos.list_items(CAT_PROMPT, db_name=db_name)),
-        "messageCount":  len(cosmos.list_items(CAT_TEMPLATE, db_name=db_name)),
-        "recoveryAgent":  _resolve_agent_label(recovery_agent, db_name=db_name),
-        "messagingAgent": _resolve_agent_label(messaging_agent, db_name=db_name),
-        "recoveryAgentActive": bool(settings.get("recoveryAgentActive", True)),
-        "messagingAgentActive": bool(settings.get("messagingAgentActive", True)),
+        "brandCount":          len(cosmos.list_items(CAT_BRAND,    db_name=db_name)),
+        "promptCount":         len(cosmos.list_items(CAT_PROMPT,   db_name=db_name)),
+        "messageCount":        len(cosmos.list_items(CAT_TEMPLATE, db_name=db_name)),
+        "recoveryAgent":       _resolve_agent_label(recovery_agent,  db_name=db_name),
+        "messagingAgent":      _resolve_agent_label(messaging_agent, db_name=db_name),
+        "recoveryAgentActive": bool(settings.get("recoveryAgentActive",  True)),
+        "messagingAgentActive":bool(settings.get("messagingAgentActive", True)),
     }
-

@@ -1,6 +1,13 @@
 import { useState, useEffect } from 'react'
 import { api } from '../api'
 
+// Maps component id → DB field name and vice versa
+const DB_KEY_MAP = {
+  airline:    'Airline_api',
+  cdp:        'Cdp_Api',
+  disruption: 'Disruption_Api',
+}
+
 const DEFAULT_APIS = [
   {
     id: 'airline',
@@ -9,7 +16,7 @@ const DEFAULT_APIS = [
     dot: 'purple',
     baseUrl: '',
     apiKey: '',
-    isActive: true
+    isActive: true,
   },
   {
     id: 'cdp',
@@ -18,7 +25,7 @@ const DEFAULT_APIS = [
     dot: 'green',
     baseUrl: '',
     apiKey: '',
-    isActive: true
+    isActive: true,
   },
   {
     id: 'disruption',
@@ -27,25 +34,56 @@ const DEFAULT_APIS = [
     dot: 'yellow',
     baseUrl: '',
     apiKey: '',
-    isActive: true
-  }
+    isActive: true,
+  },
 ]
 
+/** Normalize DB response (flat keys OR apis array) → component state array */
+function normalizeApis(data) {
+  // New format: already an array
+  if (Array.isArray(data.apis) && data.apis.length > 0) return data.apis
+
+  // Current DB format: { Airline_api: {...}, Cdp_Api: {...}, Disruption_Api: {...} }
+  return DEFAULT_APIS.map(def => {
+    const dbObj = data[DB_KEY_MAP[def.id]]
+    if (!dbObj) return def
+    return {
+      ...def,
+      baseUrl:  dbObj.baseUrl  ?? dbObj.base_url  ?? '',
+      apiKey:   dbObj.apiKey   ?? dbObj.api_key   ?? '',
+      isActive: dbObj.isActive ?? dbObj.is_active  ?? true,
+    }
+  })
+}
+
+/** Convert component state array → DB flat-key payload */
+function denormalizeApis(apisArray, existingSettings) {
+  const flatKeys = Object.fromEntries(
+    apisArray.map(a => [
+      DB_KEY_MAP[a.id],
+      { baseUrl: a.baseUrl, apiKey: a.apiKey, isActive: a.isActive },
+    ])
+  )
+  return {
+    ...existingSettings,
+    ...flatKeys,
+    apis: apisArray, // keep array for forward compatibility
+  }
+}
+
 export default function ApiSettings() {
-  const [apis, setApis] = useState(DEFAULT_APIS)
-  const [settings, setSettings] = useState(null)
-  const [loadError, setLoadError] = useState(false)
+  const [apis, setApis]             = useState(DEFAULT_APIS)
+  const [settings, setSettings]     = useState(null)
+  const [loadError, setLoadError]   = useState(false)
   const [saveStatus, setSaveStatus] = useState(null)
 
-  useEffect(() => {
-    loadSettings()
-  }, [])
+  useEffect(() => { loadSettings() }, [])
 
   const loadSettings = async () => {
     try {
       const data = await api.getSettings()
       setSettings(data)
-      setApis(data.apis || DEFAULT_APIS)
+      setApis(normalizeApis(data))
       setLoadError(false)
     } catch {
       setLoadError(true)
@@ -65,15 +103,10 @@ export default function ApiSettings() {
   const handleSave = async () => {
     if (!settings) return
     try {
-      const saved = await api.saveSettings({
-        apis,
-        recoveryAgent: settings.recoveryAgent || 'Select Agent',
-        messagingAgent: settings.messagingAgent || 'Select Agent',
-        recoveryAgentActive: settings.recoveryAgentActive !== false,
-        messagingAgentActive: settings.messagingAgentActive !== false
-      })
+      const payload = denormalizeApis(apis, settings)
+      const saved = await api.saveSettings(payload)
       setSettings(saved)
-      setApis(saved.apis || DEFAULT_APIS)
+      setApis(normalizeApis(saved))
       setSaveStatus('success')
       setTimeout(() => setSaveStatus(null), 3000)
     } catch {
