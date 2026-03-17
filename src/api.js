@@ -46,6 +46,37 @@ export const api = {
   getDashboardSummary: () => request('/dashboard-summary'),
 
   listBrandGuidelines: () => request('/brand-guidelines'),
+  uploadBrandGuidelineZip: (file) => {
+    const session = getSession()
+    const headers = {}
+    if (session?.dbName)   headers['x-db-name']   = session.dbName
+    if (session?.tenantId) headers['x-tenant-id'] = session.tenantId
+    const formData = new FormData()
+    formData.append('file', file)
+    return fetch(`${API_BASE}/brand-guidelines/upload`, { method: 'POST', headers, body: formData })
+      .then(async res => {
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body?.detail || 'Upload failed')
+        }
+        return res.json()
+      })
+  },
+  downloadBrandGuidelineExample: () => {
+    const session = getSession()
+    const headers = {}
+    if (session?.dbName) headers['x-db-name'] = session.dbName
+    fetch(`${API_BASE}/brand-guidelines/example`, { headers })
+      .then(r => r.blob())
+      .then(blob => {
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = 'brand-guidelines-example.zip'
+        a.click()
+        URL.revokeObjectURL(url)
+      })
+  },
   createBrandGuideline: (payload) => request('/brand-guidelines', { method: 'POST', body: JSON.stringify(payload) }),
   updateBrandGuideline: (id, payload) => request(`/brand-guidelines/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
   deleteBrandGuideline: (id) => request(`/brand-guidelines/${id}`, { method: 'DELETE' }),

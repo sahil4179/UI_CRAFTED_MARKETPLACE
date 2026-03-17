@@ -1,65 +1,11 @@
 import { useEffect, useState, useRef } from 'react'
 import { api } from '../api'
 
-function generateExampleZip() {
-  const content = 'colors.txt: primary=#4f46e5\ntypography.txt: font=Inter\nlogo.txt: url=https://example.com/logo.png'
-  const blob = new Blob([content], { type: 'text/plain' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = 'brand-guidelines-example.txt'
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-function readFileText(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result || ''))
-    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`))
-    reader.readAsText(file)
-  })
-}
-
-function parseBrandPayloadsFromJson(rawText, fileName) {
-  let parsed
-  try {
-    parsed = JSON.parse(rawText)
-  } catch {
-    throw new Error(`${fileName}: invalid JSON format`)
-  }
-
-  let list = []
-  if (Array.isArray(parsed)) list = parsed
-  else if (Array.isArray(parsed?.documents)) list = parsed.documents
-  else if (Array.isArray(parsed?.guidelines)) list = parsed.guidelines
-  else if (parsed && typeof parsed === 'object') list = [parsed]
-
-  const normalized = list
-    .filter(item => item && typeof item === 'object')
-    .map((item, idx) => {
-      const name = String(item.name || item.filename || `${fileName} guideline ${idx + 1}`).trim()
-      const fileType = String(item.fileType || item.type || 'json').toLowerCase()
-
-      return {
-        name,
-        size: item.size ? String(item.size) : 'JSON import',
-        fileType: fileType === 'rar' ? 'rar' : fileType === 'zip' ? 'zip' : 'json',
-        content: item          // ← store the full guideline object as content
-      }
-    })
-
-  if (normalized.length === 0) {
-    throw new Error(`${fileName}: expected a guideline object or documents/guidelines array`)
-  }
-
-  return normalized
-}
-
 export default function BrandGuidelines() {
   const [documents, setDocuments] = useState([])
   const [dragover, setDragover] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [uploading, setUploading] = useState(false)
   const [uploadStatus, setUploadStatus] = useState(null)
   const inputRef = useRef()
 
@@ -79,64 +25,33 @@ export default function BrandGuidelines() {
 
   const handleFiles = async (files) => {
     setUploadStatus(null)
-    const allowed = ['application/zip', 'application/x-rar-compressed', 'application/x-zip-compressed', 'application/octet-stream', 'application/json', 'text/json']
-    const valid = Array.from(files).filter(f =>
-      allowed.includes(f.type) || f.name.endsWith('.zip') || f.name.endsWith('.rar') || f.name.endsWith('.json')
-    )
+    const valid = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.zip'))
     if (valid.length === 0) {
-      alert('Only ZIP, RAR and JSON files are supported.')
+      setUploadStatus({ type: 'error', message: 'Only ZIP archives are accepted for brand guidelines.' })
       return
     }
 
+    // Upload one zip at a time (take the first valid one)
+    const file = valid[0]
+    setUploading(true)
     try {
-      const payloads = []
-
-      for (const file of valid) {
-        const lowerName = file.name.toLowerCase()
-        if (lowerName.endsWith('.json')) {
-          const rawText = await readFileText(file)
-          payloads.push(...parseBrandPayloadsFromJson(rawText, file.name))
-          continue
-        }
-
-        payloads.push({
-          name: file.name,
-          size: (file.size / 1024).toFixed(1) + ' KB',
-          fileType: lowerName.endsWith('.rar') ? 'rar' : 'zip',
-          content: { raw_content: null, file_type: lowerName.endsWith('.rar') ? 'rar' : 'zip' }
-        })
-      }
-
-      if (payloads.length === 0) {
-        setUploadStatus({ type: 'error', message: 'No brand guidelines found in uploaded files.' })
-        return
-      }
-
-      const hasActive = documents.some(d => d.isActive)
-      const created = []
-      let shouldAssignActive = !hasActive
-
-      for (const payload of payloads) {
-        const next = await api.createBrandGuideline({
-          ...payload,
-          isActive: shouldAssignActive
-        })
-        if (shouldAssignActive) shouldAssignActive = false
-        created.push(next)
-      }
-
-      const activeCreated = created.find(d => d.isActive)
+      const created = await api.uploadBrandGuidelineZip(file)
       setDocuments(prev => {
-        const nextPrev = activeCreated ? prev.map(d => ({ ...d, isActive: false })) : prev
-        return [...created, ...nextPrev]
+        // Deactivate existing docs locally if the new set has an active one
+        const hasActive = created.some(d => d.isActive)
+        const updated = hasActive ? prev.map(d => ({ ...d, isActive: false })) : prev
+        return [...created, ...updated]
       })
-
       setUploadStatus({
         type: 'success',
-        message: `Imported ${created.length} guideline${created.length > 1 ? 's' : ''} successfully.`
+        message: `Extracted ${created.length} file${created.length !== 1 ? 's' : ''} from ${file.name} successfully.`,
       })
     } catch (error) {
-      setUploadStatus({ type: 'error', message: error.message || 'Failed to upload documents' })
+      setUploadStatus({ type: 'error', message: error.message || 'Failed to upload ZIP archive' })
+    } finally {
+      setUploading(false)
+      // Reset input so the same file can be re-selected after deletion
+      if (inputRef.current) inputRef.current.value = ''
     }
   }
 
@@ -160,7 +75,7 @@ export default function BrandGuidelines() {
       const updated = await api.updateBrandGuideline(doc.id, { isActive: !doc.isActive })
       setDocuments(prev => prev.map(item => {
         if (item.id === doc.id) return updated
-        if (updated.isActive) return { ...item, isActive: false }  // only one active
+        if (updated.isActive) return { ...item, isActive: false }
         return item
       }))
     } catch (error) {
@@ -178,7 +93,7 @@ export default function BrandGuidelines() {
       <div className="card" style={{ marginBottom: 20 }}>
         <div className="card-header">
           <h2>Upload Documents</h2>
-          <button className="btn btn-outline" onClick={generateExampleZip}>
+          <button className="btn btn-outline" onClick={() => api.downloadBrandGuidelineExample()}>
             ⬇ Download Example
           </button>
         </div>
@@ -190,25 +105,33 @@ export default function BrandGuidelines() {
         )}
 
         <div
-          className={`upload-zone${dragover ? ' dragover' : ''}`}
+          className={`upload-zone${dragover ? ' dragover' : ''}${uploading ? ' uploading' : ''}`}
           onDragOver={e => { e.preventDefault(); setDragover(true) }}
           onDragLeave={() => setDragover(false)}
           onDrop={handleDrop}
-          onClick={() => inputRef.current.click()}
+          onClick={() => !uploading && inputRef.current.click()}
         >
-          <div className="upload-icon">📁</div>
-          <p>Drag and drop your files here, or <span>browse</span></p>
-          <small>Supported formats: ZIP, RAR, JSON</small>
-          <small>Upload a ZIP file containing your brand token files (colors.txt, typography.txt, etc.)</small>
-          <small>For JSON, upload an object, an array, or a documents/guidelines array.</small>
           <input
             ref={inputRef}
             type="file"
-            accept=".zip,.rar,.json"
-            multiple
+            accept=".zip"
             style={{ display: 'none' }}
             onChange={e => handleFiles(e.target.files)}
           />
+          {uploading ? (
+            <>
+              <div className="upload-icon">⏳</div>
+              <p>Uploading and extracting archive…</p>
+            </>
+          ) : (
+            <>
+              <div className="upload-icon">📁</div>
+              <p>Drag and drop your ZIP file here, or <span>browse</span></p>
+              <small>Supported format: ZIP · File must be named brand-guidelines.zip</small>
+              <small>Expected files: colors.json, typography.json, spacing.json, borderRadius.json, shadows.json</small>
+              <small>Also accepts: .txt, .md, .csv, .xml, .yaml, .yml inside the archive</small>
+            </>
+          )}
         </div>
       </div>
 
@@ -220,7 +143,7 @@ export default function BrandGuidelines() {
 
         {loading ? (
           <div className="empty-state">
-            <p>Loading documents...</p>
+            <p>Loading documents…</p>
           </div>
         ) : documents.length === 0 ? (
           <div className="empty-state">
@@ -234,7 +157,13 @@ export default function BrandGuidelines() {
                 <span className="file-item-icon">🗜</span>
                 <div>
                   <div className="file-item-name">{doc.name}</div>
-                  <div className="file-item-size">{doc.size} · {doc.fileType?.toUpperCase() || 'ZIP'}</div>
+                  <div className="file-item-size">
+                    {doc.size && `${doc.size} · `}
+                    {(doc.fileType || 'zip').replace(/^\./, '').toUpperCase()}
+                    {doc.sourceArchive && (
+                      <span style={{ marginLeft: 6, opacity: 0.6 }}>from {doc.sourceArchive}</span>
+                    )}
+                  </div>
                 </div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>

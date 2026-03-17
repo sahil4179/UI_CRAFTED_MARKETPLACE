@@ -2,12 +2,15 @@ from typing import Any, Optional
 from uuid import uuid4
 import re
 import os
+import io
+import zipfile
+import csv as _csv
 
 import bcrypt as _bcrypt_lib
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from cosmos_IO import CosmosConnectionError, CosmosIO
@@ -175,11 +178,17 @@ class AgentSettingsIn(BaseModel):
 # ── Document normalisers (DB → frontend shape) ───────────────────────────────
 
 def _normalize_brand(doc: dict) -> dict:
-    return {"id": doc.get("id"), "isActive": _is_active(doc),
-            "name":     _pick(doc, "name", "filename", default="Untitled"),
-            "size":     doc.get("size") or "",
-            "fileType": _pick(doc, "fileType", "file_type", default="zip"),
-            "content":  doc.get("content")}
+    return {
+        "id":            doc.get("id"),
+        "isActive":      _is_active(doc),
+        "name":          _pick(doc, "name", "filename", default="Untitled"),
+        "filename":      _pick(doc, "filename", "name", default="Untitled"),
+        "size":          doc.get("size") or "",
+        "fileType":      _pick(doc, "fileType", "file_type", default="zip"),
+        "content":       doc.get("content"),
+        "sourceArchive": doc.get("sourceArchive") or doc.get("source_archive"),
+        "uploadedAt":    doc.get("uploadedAt") or doc.get("createdAt"),
+    }
 
 
 def _normalize_prompt(doc: dict) -> dict:
@@ -424,9 +433,259 @@ def list_agents(db_name: str = Depends(require_db)) -> list[dict]:
 
 # ── Brand Guidelines ──────────────────────────────────────────────────────────
 
+_EXTRACTABLE_EXTENSIONS = {".txt", ".json", ".md", ".csv", ".xml", ".yaml", ".yml"}
+
+
+def _parse_zip_file_content(text: str, ext: str) -> dict:
+    """Parse extracted file text into a JSON-serialisable dict."""
+    try:
+        if ext == ".json":
+            import json as _json
+            return _json.loads(text)
+        elif ext == ".csv":
+            reader = _csv.DictReader(io.StringIO(text))
+            return {"rows": list(reader)}
+        elif ext in (".yaml", ".yml"):
+            try:
+                import yaml
+                parsed = yaml.safe_load(text)
+                return parsed if isinstance(parsed, dict) else {"data": parsed}
+            except ImportError:
+                return {"raw_content": text}
+        elif ext == ".xml":
+            return {"xml_content": text}
+        else:
+            return {"text": text}
+    except Exception as exc:
+        return {"raw_content": text, "parse_error": str(exc)}
+
+
+def _extract_zip_and_save(file_bytes: bytes, archive_filename: str, db_name: str) -> list[dict]:
+    """Extract a ZIP archive and persist each supported file as a brand-guideline doc."""
+    saved: list[dict] = []
+    try:
+        zf_buf = io.BytesIO(file_bytes)
+        with zipfile.ZipFile(zf_buf, "r") as zf:
+            for entry in zf.namelist():
+                if entry.endswith("/"):        # skip directories
+                    continue
+                ext = os.path.splitext(entry)[1].lower()
+                if ext not in _EXTRACTABLE_EXTENSIONS:
+                    continue
+                fname = os.path.basename(entry)
+                try:
+                    raw = zf.read(entry)
+                    text = raw.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                parsed = _parse_zip_file_content(text, ext)
+                size_str = f"{len(raw) / 1024:.1f} KB"
+                is_first = len(saved) == 0
+                new_id = str(uuid4())
+                if is_first:
+                    cosmos.deactivate_others(CAT_BRAND, new_id, db_name=db_name)
+                doc = {
+                    "id":            new_id,
+                    "name":          fname,
+                    "filename":      fname,
+                    "fileType":      ext,
+                    "size":          size_str,
+                    "content":       parsed,
+                    "sourceArchive": archive_filename,
+                    "isActive":      is_first,
+                }
+                saved.append(cosmos.upsert_item(CAT_BRAND, doc, db_name=db_name))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid ZIP archive")
+    if not saved:
+        raise HTTPException(
+            status_code=422,
+            detail="The ZIP archive contained no supported files (.txt, .json, .md, .csv, .xml, .yaml, .yml)"
+        )
+    return saved
+
+
+_EXAMPLE_BRAND_FILES = {
+    "colors.json": """{
+  "baseColors": {
+    "airlineBlue": "#003A8F",
+    "skyBlue": "#00A8E8",
+    "cloudWhite": "#F5F7FA",
+    "runwayGrey": "#4A4F5A",
+    "successGreen": "#2ECC71",
+    "warningAmber": "#FFC107",
+    "alertRed": "#D72638",
+    "sunGold": "#C89B3C"
+  },
+  "backgroundColors": {
+    "primary": "#003A8F",
+    "secondary": "#4A4F5A",
+    "warning": "#FFC107",
+    "danger": "#D72638",
+    "white": "#F5F7FA"
+  },
+  "textColors": {
+    "primary": "#F5F7FA",
+    "highlight": "#00A8E8",
+    "success": "#2ECC71",
+    "cta": "#C89B3C",
+    "danger": "#D72638"
+  },
+  "iconColors": {
+    "primary": "#F5F7FA",
+    "highlight": "#00A8E8",
+    "success": "#2ECC71",
+    "cta": "#C89B3C"
+  },
+  "borderColors": {
+    "primary": "#F5F7FA",
+    "divider": "#4A4F5A",
+    "highlight": "#00A8E8",
+    "cta": "#C89B3C"
+  },
+  "gradients": {
+    "sky": {
+      "name": "Sky Gradient",
+      "colors": ["#003A8F", "#00A8E8"],
+      "css": "linear-gradient(180deg, #003A8F 0%, #00A8E8 100%)"
+    },
+    "sunrise": {
+      "name": "Sunrise CTA",
+      "colors": ["#FFC107", "#C89B3C"],
+      "css": "linear-gradient(180deg, #FFC107 0%, #C89B3C 100%)"
+    }
+  }
+}""",
+    "typography.json": """{
+  "fontFamilies": {
+    "display": "Bauhaus Std, sans-serif",
+    "body": "Poppins, sans-serif"
+  },
+  "fontWeights": {
+    "regular": 400,
+    "medium": 500,
+    "semiBold": 600
+  },
+  "letterSpacing": { "none": "0" },
+  "lineHeight": { "auto": "auto" },
+  "textTransform": { "none": "none", "uppercase": "uppercase" },
+  "webTypography": {
+    "display": { "large": { "fontFamily": "Bauhaus Std, sans-serif", "fontSize": "36px", "fontWeight": 500 } },
+    "heading": { "medium": { "fontFamily": "Poppins, sans-serif", "fontSize": "24px", "fontWeight": 500 } },
+    "body":    { "medium": { "fontFamily": "Poppins, sans-serif", "fontSize": "14px", "fontWeight": 400 } },
+    "label":   { "small":  { "fontFamily": "Poppins, sans-serif", "fontSize": "10px", "fontWeight": 400 } }
+  },
+  "mobileTypography": {
+    "display": { "medium": { "fontFamily": "Bauhaus Std, sans-serif", "fontSize": "24px", "fontWeight": 500 } },
+    "heading": { "small":  { "fontFamily": "Poppins, sans-serif", "fontSize": "16px", "fontWeight": 600 } },
+    "body":    { "medium": { "fontFamily": "Poppins, sans-serif", "fontSize": "12px", "fontWeight": 400 } },
+    "label":   { "small":  { "fontFamily": "Poppins, sans-serif", "fontSize": "8px",  "fontWeight": 400 } }
+  }
+}""",
+    "spacing.json": """{
+  "spacing": { "0": "0", "2": "8px", "4": "16px", "6": "24px", "8": "32px", "10": "40px" },
+  "padding":  { "none": "0", "sm": "8px", "base": "16px", "lg": "24px", "xl": "32px" },
+  "margin":   { "none": "0", "sm": "8px", "base": "16px", "lg": "24px" },
+  "gap":      { "none": "0", "sm": "8px", "base": "16px", "lg": "24px" },
+  "componentSpacing": {
+    "button": { "small": "32px", "medium": "40px", "large": "56px" },
+    "input":  { "web": { "standard": "44px" }, "mobile": { "standard": "40px" } },
+    "checkbox": { "web": "32px", "mobile": "24px" },
+    "toggle": { "small": "36px", "medium": "44px" }
+  }
+}""",
+    "borderRadius.json": """{
+  "borderRadius": {
+    "none": "0", "sm": "4px", "base": "8px", "lg": "12px", "xl": "16px", "full": "50%"
+  },
+  "semanticBorderRadius": {
+    "button":   { "small": "8px", "medium": "12px", "large": "16px" },
+    "card":     "12px",
+    "input":    { "small": "4px", "medium": "8px" },
+    "badge":    { "small": "16px", "medium": "20px" },
+    "avatar":   "50%",
+    "checkbox": "4px",
+    "radio":    "50%",
+    "toggle":   "50%"
+  }
+}""",
+    "shadows.json": """{
+  "shadows": {
+    "none": "none",
+    "sm":   "0 1px 3px rgba(0, 0, 0, 0.1)",
+    "base": "0 2px 6px rgba(0, 0, 0, 0.15)",
+    "md":   "0 4px 12px rgba(0, 0, 0, 0.2)",
+    "lg":   "0 8px 20px rgba(0, 0, 0, 0.25)"
+  },
+  "semanticShadows": {
+    "card":         "0 2px 6px rgba(0, 0, 0, 0.15)",
+    "modal":        "0 8px 20px rgba(0, 0, 0, 0.25)",
+    "dropdown":     "0 4px 12px rgba(0, 0, 0, 0.2)",
+    "tooltip":      "0 1px 3px rgba(0, 0, 0, 0.1)",
+    "notification": "0 4px 12px rgba(0, 0, 0, 0.2)"
+  }
+}""",
+}
+
+
+@app.get("/api/brand-guidelines/example")
+def download_example_brand_guidelines():
+    """Stream brand-guidelines.zip containing the five standard token files."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, content in _EXAMPLE_BRAND_FILES.items():
+            zf.writestr(filename, content)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=brand-guidelines.zip"},
+    )
+
+
 @app.get("/api/brand-guidelines")
 def list_brand_guidelines(db_name: str = Depends(require_db)) -> list[dict]:
     return [_normalize_brand(d) for d in _ensure_single_active(CAT_BRAND, cosmos.list_items(CAT_BRAND, db_name=db_name), db_name=db_name)]
+
+
+@app.post("/api/brand-guidelines/upload")
+async def upload_brand_guideline_zip(
+    file: UploadFile = File(...),
+    db_name: str = Depends(require_db),
+) -> list[dict]:
+    """
+    Accept a ZIP archive, extract its contents, and store each supported file
+    as a separate brand-guideline document.  Blocks upload when archive-sourced
+    documents already exist (delete them first).
+    """
+    fname_lower = (file.filename or "").lower()
+    if not fname_lower.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only ZIP archives are accepted for brand guidelines")
+    if fname_lower != "brand-guidelines.zip":
+        raise HTTPException(
+            status_code=400,
+            detail="The ZIP must be named 'brand-guidelines.zip'. Download the example to see the expected structure."
+        )
+
+    # Guardrail: block if archive-sourced docs already exist
+    existing = cosmos.list_items(CAT_BRAND, db_name=db_name)
+    archive_docs = [d for d in existing if d.get("sourceArchive") or d.get("source_archive")]
+    if archive_docs:
+        filenames = [d.get("filename") or d.get("name", "unknown") for d in archive_docs]
+        source = archive_docs[0].get("sourceArchive") or archive_docs[0].get("source_archive", "unknown")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A ZIP archive has already been uploaded (source: {source}). "
+                f"Please delete the following {len(archive_docs)} file(s) before uploading a new archive: "
+                f"{', '.join(filenames)}"
+            ),
+        )
+
+    file_bytes = await file.read()
+    saved = _extract_zip_and_save(file_bytes, file.filename or "upload.zip", db_name)
+    return [_normalize_brand(d) for d in saved]
+
 
 @app.post("/api/brand-guidelines")
 def create_brand_guideline(payload: BrandGuidelineIn, db_name: str = Depends(require_db)) -> dict:
