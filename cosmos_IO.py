@@ -103,6 +103,30 @@ class CosmosIO:
     def find_one_by_field(self, col: str, field: str, value: str, db_name: str | None = None) -> dict | None:
         return _db(db_name)[col].find_one({field: value}, _NO_ID)
 
+    def copy_agents_to_tenant(self, tenant_db_name: str) -> int:
+        """Copy all agents from flight_operations.agents (the shared master DB)
+        to the newly created tenant's agents collection.
+        Skips agents that already exist (matched by `id`) to avoid duplicates.
+        Returns the number of agents copied.
+        """
+        source_agents = list(_db(None)["agents"].find({}, {"_id": 0}))
+        if not source_agents:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        tenant_agents_col = _db(tenant_db_name)["agents"]
+        copied = 0
+        for agent in source_agents:
+            agent_id = agent.get("id")
+            if not agent_id:
+                continue
+            # Skip if this agent already exists in the tenant DB (idempotent)
+            if tenant_agents_col.find_one({"id": agent_id}):
+                continue
+            new_agent = {**agent, "createdAt": now, "updatedAt": now}
+            tenant_agents_col.insert_one(new_agent)
+            copied += 1
+        return copied
+
     def ensure_tenant_collections(self, db_name: str) -> None:
         """Explicitly create all standard tenant collections if they don't exist yet.
         CosmosDB for MongoDB sometimes requires explicit collection creation before
