@@ -28,14 +28,16 @@ This document explains every function in `cosmos_IO.py` and `backend/main.py`: w
 
 ```
 .
-├── .env                  # Environment variables (DB credentials)
-├── cosmos_IO.py          # All database logic (connection + CRUD + read helpers)
-├── requirements.txt      # Python dependencies
-├── backend/
-│   └── main.py           # FastAPI app — defines all HTTP endpoints
-└── src/                  # React frontend
-    ├── api.js            # Frontend API client
-    └── pages/            # UI pages that call api.js
+├── .env                      # Environment variables (DB credentials)
+├── backend/                  # FastAPI service
+│   ├── main.py               # HTTP endpoints
+│   ├── cosmos_IO.py          # DB connection + CRUD + read helpers
+│   └── requirements.txt      # Python dependencies
+└── frontend/                 # Vite + React app
+  ├── package.json
+  ├── vite.config.js
+  ├── index.html
+  └── src/                  # UI + api client
 ```
 
 ---
@@ -471,7 +473,7 @@ backend/main.py  (FastAPI)
   │  returns JSON response
       │
       ▼
-cosmos_IO.py  (CosmosIO class)
+backend/cosmos_IO.py  (CosmosIO class)
   │  uses singleton _db() client
   │  executes MongoDB query
       │
@@ -485,13 +487,14 @@ Azure Cosmos DB for MongoDB
 ## Running the Project
 
 ```bash
-# 1. Install Python dependencies
-pip install -r requirements.txt
+# 1. Install backend dependencies (from project root)
+pip install -r backend/requirements.txt
 
 # 2. Start the backend (from project root)
 uvicorn backend.main:app --reload --port 8000
 
 # 3. Install frontend dependencies
+cd frontend
 npm install
 
 # 4. Start the frontend

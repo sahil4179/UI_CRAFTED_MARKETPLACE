@@ -1,4 +1,4 @@
-const API_BASE = '/api'
+const API_BASE = 'https://adminpanelapi-v2.niceflower-39d2e00e.southindia.azurecontainerapps.io/api'
 
 function getSession() {
   try { return JSON.parse(sessionStorage.getItem('tenant_session') || 'null') } catch { return null }
